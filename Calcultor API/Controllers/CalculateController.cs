@@ -1,65 +1,102 @@
-using Microsoft.AspNetCore.Mvc;
-using Calcultor_API.Models;
+ï»¿using Microsoft.AspNetCore.Mvc;
+using System.Globalization;
+using System.Net.Http.Headers;
+using Calcultor_API.Utils;
 
 namespace Calcultor_API.Controllers
 {
-    [ApiController]             // API Controller »ý¼º
-    [Route("[controller]")]     // Route ¼³Á¤ (¿¹: /calculate)
+    [ApiController]
+    [Route("calc")]
+    [Produces("application/json")]
     public class CalculateController : ControllerBase
     {
-        private const string ValidToken = "secret_token_123";       //  À¯È¿ÇÑ ÅäÅ« ¼³Á¤
+        private readonly ILogger<CalculateController> _logger;
+        private const string ValidToken = "secret_token_123";
 
-        [HttpPost]
-        public IActionResult Post([FromBody] ExpressionRequest request)           // POST ¸Þ¼­µå »ý¼º, IActionResult·Î ÀÀ´ä ¹ÝÈ¯
+        public CalculateController(ILogger<CalculateController> logger) => _logger = logger;
+
+        private bool TryAuthorize(out IActionResult? unauthorized)
         {
-            var authHeader = Request.Headers["Authorization"].FirstOrDefault();              // Authorization Çì´õ¿¡¼­ ÅäÅ« ÃßÃâ
-            if (string.IsNullOrEmpty(authHeader) || !authHeader.StartsWith("Bearer "))
+            unauthorized = null;
+            if (!Request.Headers.TryGetValue("Authorization", out var authValue) ||
+                !AuthenticationHeaderValue.TryParse(authValue, out var authHeader) ||
+                !string.Equals(authHeader.Scheme, "Bearer", StringComparison.OrdinalIgnoreCase) ||
+                string.IsNullOrWhiteSpace(authHeader.Parameter))
             {
-                return Unauthorized(new { error = "Authorization header missing or malformed" });
+                unauthorized = Unauthorized(new { error = "Authorization header missing or malformed" });
+                return false;
             }
-
-            var token = authHeader.Replace("Bearer ", "").Trim();
-
-            if (token != ValidToken)
+            if (!string.Equals(authHeader.Parameter, ValidToken, StringComparison.Ordinal))
             {
-                return Unauthorized(new { error = "Invalid token" });
+                unauthorized = Unauthorized(new { error = "Invalid token" });
+                return false;
             }
+            return true;
+        }
 
-            if (request == null || string.IsNullOrWhiteSpace(request.Expression))
-                    return BadRequest(new { error = "Expression is required." });
+        private static bool TryParseInvariant(string s, out double value) =>
+            double.TryParse(s, NumberStyles.Float | NumberStyles.AllowThousands, CultureInfo.InvariantCulture, out value);
+
+        private IActionResult DoOp(string endpoint, string num1Str, string num2Str, Func<double, double, double> op, string symbol)
+        {
+            if (!TryAuthorize(out var unauth)) return unauth!;
+
+            if (string.IsNullOrWhiteSpace(num1Str) || string.IsNullOrWhiteSpace(num2Str))
+                return BadRequest(new { error = "num1 and num2 are required." });
+
+            if (!TryParseInvariant(num1Str, out var a) || !TryParseInvariant(num2Str, out var b))
+                return BadRequest(new { error = "Invalid number." });
+
+            if (symbol == "/" && b == 0)
+                return BadRequest(new { error = "Cannot divide by zero." });
+
             try
             {
-                string cleanexpression = request.Expression
-                    .Replace("¡¿", "*")
-                    .Replace("¡À", "/");
+                // 1. ì—°ì‚° ê²°ê³¼ ê³„ì‚°
+                var result = op(a, b).ToString(CultureInfo.InvariantCulture);
 
-                var result = new System.Data.DataTable().Compute(cleanexpression, null);
+                ServerLog.Request(symbol, num1Str, num2Str);
+                ServerLog.Response(result);
 
-                if (double.TryParse(result.ToString(), out double numericResult) && double.IsInfinity(numericResult))
+                // 2. ìš”ì²­/ì‘ë‹µ ë¡œê¹…ìš© ë¬¸ìžì—´ ì¤€ë¹„
+                var prettyReq = $"{DateTime.Now:yyyy-MM-dd HH:mm:ss}ìš”ì²­ :\n{{\n  op = \"{symbol}\"\n  num1 = \"{num1Str}\"\n  num2 = \"{num2Str}\"\n}}\n";
+                var prettyRes = $"ì‘ë‹µ :\n{{\n  result = \"{result}\"\n}}\n";
+
+                // 4. ì‘ë‹µ ê°ì²´ ìƒì„±
+                var response = new
                 {
-                    return BadRequest(new { error = "Cannot divide by zero." });
-                }
+                    op = symbol,
+                    num1 = a.ToString(CultureInfo.InvariantCulture),
+                    num2 = b.ToString(CultureInfo.InvariantCulture),
+                    result
+                };
 
-                return Ok(new
-                {
-                    expression = request.Expression,
-                    result = result,
-                    _links = new
-                    {
-                        self = "/calculate",
-                        history = "/history"
-                    }
-                });
+                return Ok(response);
             }
-            catch (Exception)
+            catch (Exception ex)
             {
-                return BadRequest(new { error = "Invalid expression"});
+                ServerLog.Error(ex.Message);
+
+                _logger.LogWarning(ex, "Compute failed on {Endpoint} ({Num1},{Num2})", endpoint, num1Str, num2Str);
+                Console.WriteLine($"[ERR] {endpoint} {ex.Message}");
+                return BadRequest(new { error = "Invalid expression" });
             }
         }
 
-    }
-    public class ExpressionRequest        
-    {
-        public string Expression { get; set; }
+        [HttpGet("add")]
+        public IActionResult Add([FromQuery] string num1, [FromQuery] string num2)
+            => DoOp("/calc/add", num1, num2, (a, b) => a + b, "+");
+
+        [HttpGet("sub")]
+        public IActionResult Sub([FromQuery] string num1, [FromQuery] string num2)
+            => DoOp("/calc/sub", num1, num2, (a, b) => a - b, "-");
+
+        [HttpGet("mul")]
+        public IActionResult Mul([FromQuery] string num1, [FromQuery] string num2)
+            => DoOp("/calc/mul", num1, num2, (a, b) => a * b, "*");
+
+        [HttpGet("div")]
+        public IActionResult Div([FromQuery] string num1, [FromQuery] string num2)
+            => DoOp("/calc/div", num1, num2, (a, b) => a / b, "/");
     }
 }
